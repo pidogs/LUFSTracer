@@ -1,14 +1,32 @@
 package com.pidog.lufstracer
 
+data class HistogramBucket(
+    val rangeStartDb: Int, // e.g. -14 means [-14, -13)
+    val count: Int
+)
+
 data class LufsMetrics(
-    val integrated: Double,       // LUFS
-    val truePeak: Double,         // dBTP
-    val shortTerm: Double,        // LUFS
-    val momentary: Double,        // LUFS
-    val dynamicRange: Double,     // LU (LRA)
-    val plr: Double,              // Peak to Loudness Ratio (LU)
-    val psr: Double,              // Peak to Short-Term Ratio (LU)
-    val relativeThreshold: Double, // dBFS
-    val samplePeak: Double,        // dBFS
-    val leftRightShift: Double
+    val integrated: Double,
+    val truePeak: Double,
+    val shortTerm: Double,
+    val momentary: Double,
+    val dynamicRange: Double,
+    val plr: Double,
+    val psr: Double,
+    val relativeThreshold: Double,
+    val samplePeak: Double,
+    val leftRightShift: Double,
+    val channelMetrics: List<ChannelLoudness> = emptyList(),
+    val shortTermHistogram: List<HistogramBucket> = emptyList()
+)
+
+data class ChannelLoudness(
+    val channelName: String,
+    val integrated: Double,
+    val truePeak: Double,
+    val shortTerm: Double,
+    val momentary: Double,
+    val samplePeak: Double,
+    val isUsedInLufs: Boolean,
+    val lufsWeight: Float
 )
