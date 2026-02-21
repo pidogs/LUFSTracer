@@ -19,6 +19,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.core.content.ContextCompat
 import androidx.compose.ui.platform.LocalContext
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -36,8 +37,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AudioFile
@@ -46,14 +45,18 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.TextStyle as ComposeTextStyle
-import androidx.compose.ui.graphics.toArgb
 import kotlin.math.floor
 import androidx.compose.ui.platform.LocalView
 
+// Notification Imports
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -71,6 +74,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@SuppressLint("MissingPermission")
 @Composable
 fun AudioDecoderScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -84,10 +88,10 @@ fun AudioDecoderScreen(modifier: Modifier = Modifier) {
     var progress by remember { mutableFloatStateOf(0f) }
 
     // Time tracking states
-    var startTime by remember { mutableStateOf(0L) }
-    var elapsedTime by remember { mutableStateOf(0L) }
-    var predictedTotalTime by remember { mutableStateOf(0L) }
-    var predictedRemaining by remember { mutableStateOf(0L) }
+    var startTime by remember { mutableLongStateOf(0L) }
+    var elapsedTime by remember { mutableLongStateOf(0L) }
+    var predictedTotalTime by remember { mutableLongStateOf(0L) }
+    var predictedRemaining by remember { mutableLongStateOf(0L) }
 
     // File and phase tracking
     var fileName by remember { mutableStateOf("") }
@@ -96,6 +100,24 @@ fun AudioDecoderScreen(modifier: Modifier = Modifier) {
     // Track whether we've ever started an analysis
     var hasStarted by remember { mutableStateOf(false) }
 
+    // Notification Details
+    val channelId = "lufs_analysis_channel"
+    val notificationId = 1001
+
+    // Initialize Notification Channel for Android O+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "LUFS Analysis",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Shows progress of background audio analysis"
+            }
+            val notificationManager = context.getSystemService(NotificationManager::class.java)
+            notificationManager?.createNotificationChannel(channel)
+        }
+    }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -115,6 +137,36 @@ fun AudioDecoderScreen(modifier: Modifier = Modifier) {
                 statusText = "Decoding and analyzing audio..."
                 metrics = null
                 audioInfo = null
+
+                // --- Setup Notification ---
+                val notificationManager = NotificationManagerCompat.from(context)
+                val intent = Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                }
+                val pendingIntent = PendingIntent.getActivity(
+                    context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+
+                val notificationBuilder = NotificationCompat.Builder(context, channelId)
+                    .setSmallIcon(android.R.drawable.stat_sys_download) // Default icon for downloads/progress
+                    .setContentTitle("Analyzing $fileName")
+                    .setContentText("Decoding audio...")
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                    .setContentIntent(pendingIntent)
+                    .setProgress(100, 0, false)
+
+                val hasNotificationPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                } else true
+
+                if (hasNotificationPerm) {
+                    notificationManager.notify(notificationId, notificationBuilder.build())
+                }
+
+                var lastNotifyTime = 0L
+
                 val res = decoder.decodeUri(uri) { progressUpdate ->
                     progress = progressUpdate
                     val now = System.currentTimeMillis()
@@ -124,18 +176,52 @@ fun AudioDecoderScreen(modifier: Modifier = Modifier) {
                             (elapsedTime / progressUpdate).toLong()
                         predictedRemaining = predictedTotalTime - elapsedTime
                     }
+
+                    // Update Notification periodically (max twice a second to prevent spamming the system UI)
+                    if (now - lastNotifyTime > 500) {
+                        notificationBuilder.setProgress(100, (progressUpdate * 100).toInt(), false)
+                            .setContentText("Decoding... ${(progressUpdate * 100).toInt()}%")
+                        if (hasNotificationPerm) {
+                            notificationManager.notify(notificationId, notificationBuilder.build())
+                        }
+                        lastNotifyTime = now
+                    }
                 }
+
                 isProcessingPhase = true
                 progress = 0f
+
+                // Show indeterminate progress for final metric calculation phase
+                notificationBuilder.setContentText("Calculating loudness metrics...")
+                    .setProgress(100, 100, true)
+                if (hasNotificationPerm) {
+                    notificationManager.notify(notificationId, notificationBuilder.build())
+                }
 
                 res.fold(
                     onSuccess = { info ->
                         audioInfo = info
                         metrics = info.lufsMetrics
                         statusText = "Analysis complete!"
+
+                        notificationBuilder.setContentText("Analysis complete!")
+                            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                            .setProgress(0, 0, false)
+                            .setOngoing(false)
+                        if (hasNotificationPerm) {
+                            notificationManager.notify(notificationId, notificationBuilder.build())
+                        }
                     },
                     onFailure = { error ->
                         statusText = "Error: ${error.message}"
+
+                        notificationBuilder.setContentText("Error: ${error.message}")
+                            .setSmallIcon(android.R.drawable.stat_notify_error)
+                            .setProgress(0, 0, false)
+                            .setOngoing(false)
+                        if (hasNotificationPerm) {
+                            notificationManager.notify(notificationId, notificationBuilder.build())
+                        }
                     }
                 )
                 isDecoding = false
@@ -161,12 +247,18 @@ fun AudioDecoderScreen(modifier: Modifier = Modifier) {
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val granted = permissions.entries.all { it.value }
-        if (granted) {
+        // Check if storage permission was granted (we can proceed even if notifications are denied)
+        val storageGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            permissions[Manifest.permission.READ_EXTERNAL_STORAGE] ?: (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED)
+        }
+
+        if (storageGranted) {
             openFilePicker(filePickerLauncher)
         } else {
-            statusText = "Permission denied."
-            Toast.makeText(context, "Permission denied", Toast.LENGTH_SHORT)
+            statusText = "Storage Permission denied."
+            Toast.makeText(context, "Storage Permission denied", Toast.LENGTH_SHORT)
                 .show()
         }
     }
@@ -545,7 +637,7 @@ fun LoudnessTabs(
     val tabs = mutableListOf("Combined")
 
     // Add tabs for each channel
-    channelMetrics.forEachIndexed { index, cm ->
+    channelMetrics.forEach { cm ->
         tabs.add(cm.channelName)
     }
 
@@ -640,8 +732,7 @@ fun CombinedMetricsGrid(metrics: LufsMetrics) {
             ShortTermHistogramChart(
                 histogram = metrics.shortTermHistogram,
                 integrated = metrics.integrated,
-                modifier = Modifier.fillMaxWidth(),
-                duration = metrics.duration
+                modifier = Modifier.fillMaxWidth()
             )
         }
     }
@@ -724,8 +815,7 @@ fun ChannelMetricsGrid(
 fun ShortTermHistogramChart(
     histogram: List<HistogramBucket>,
     integrated: Double,
-    modifier: Modifier = Modifier,
-    duration: Double
+    modifier: Modifier = Modifier
 ) {
     if (histogram.isEmpty()) return
 
@@ -814,7 +904,7 @@ fun ShortTermHistogramChart(
                     // dB label every 5 dB
                     if (bucket.rangeStartDb % 30 == 0) {
                         val labelText =
-                            "${bucket.rangeStartDb / 10.0}"
+                            "${bucket.rangeStartDb / 10}"
                         val labelResult = textMeasurer.measure(
                             text = labelText,
                             style = ComposeTextStyle(
@@ -943,15 +1033,31 @@ fun MetricCard(label: String, value: String, modifier: Modifier = Modifier) {
 }
 
 private fun checkAndRequestPermissions(
-    context: android.content.Context,
+    context: Context,
     permissionLauncher: androidx.activity.result.ActivityResultLauncher<Array<String>>,
     manageStorageLauncher: androidx.activity.result.ActivityResultLauncher<Intent>,
     filePickerLauncher: androidx.activity.result.ActivityResultLauncher<Intent>
 ) {
+    val permissionsToRequest = mutableListOf<String>()
+
+    // Notification Permission Request (Android 13+)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         if (Environment.isExternalStorageManager()) {
-            openFilePicker(filePickerLauncher)
+            // Already has storage access, we just ask for notification perm if needed
+            if (permissionsToRequest.isNotEmpty()) {
+                permissionLauncher.launch(permissionsToRequest.toTypedArray())
+            } else {
+                openFilePicker(filePickerLauncher)
+            }
         } else {
+            // Must ask for manage all files via settings intent
             try {
                 val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
                 intent.data = Uri.parse("package:${context.packageName}")
@@ -962,15 +1068,14 @@ private fun checkAndRequestPermissions(
             }
         }
     } else {
-        val permissionsToRequest = arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-        val allGranted = permissionsToRequest.all {
-            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            permissionsToRequest.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
 
-        if (allGranted) {
+        if (permissionsToRequest.isEmpty()) {
             openFilePicker(filePickerLauncher)
         } else {
-            permissionLauncher.launch(permissionsToRequest)
+            permissionLauncher.launch(permissionsToRequest.toTypedArray())
         }
     }
 }
