@@ -224,6 +224,8 @@ class AudioDecoder(private val context: Context) {
             val metrics = analyzer.calculateMetrics()
             Log.d(TAG, "Done: Integrated=${String.format("%.2f", metrics.integrated)} LUFS")
 
+            metrics.duration = durationUs / 1_000_000.0;
+
             Result.success(DecodedAudioInfo(
                 sampleRate = sampleRate,
                 channelCount = channelCount,

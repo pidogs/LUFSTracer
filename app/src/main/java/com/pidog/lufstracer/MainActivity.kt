@@ -640,7 +640,8 @@ fun CombinedMetricsGrid(metrics: LufsMetrics) {
             ShortTermHistogramChart(
                 histogram = metrics.shortTermHistogram,
                 integrated = metrics.integrated,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                duration = metrics.duration
             )
         }
     }
@@ -723,12 +724,13 @@ fun ChannelMetricsGrid(
 fun ShortTermHistogramChart(
     histogram: List<HistogramBucket>,
     integrated: Double,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    duration: Double
 ) {
     if (histogram.isEmpty()) return
 
-    val startIndex = histogram.indexOfFirst { it.count > 10 }
-    val endIndex = histogram.indexOfLast { it.count > 10 }
+    val startIndex = histogram.indexOfFirst { it.count > 30 }
+    val endIndex = histogram.indexOfLast { it.count > 30 }
     if (startIndex < 0 || endIndex < 0) return
 
     val trimmed = histogram.subList(startIndex, endIndex + 1)

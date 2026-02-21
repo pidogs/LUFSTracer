@@ -17,7 +17,8 @@ data class LufsMetrics(
     val samplePeak: Double,
     val leftRightShift: Double,
     val channelMetrics: List<ChannelLoudness> = emptyList(),
-    val shortTermHistogram: List<HistogramBucket> = emptyList()
+    val shortTermHistogram: List<HistogramBucket> = emptyList(),
+    var duration: Double
 )
 
 data class ChannelLoudness(
