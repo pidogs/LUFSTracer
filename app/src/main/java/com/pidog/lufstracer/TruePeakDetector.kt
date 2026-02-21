@@ -93,104 +93,55 @@ class TruePeakDetector(
         )
     }
 
-    /** Circular buffer per channel holding the last 12 input samples. */
-    private val delayLines =
-        Array(channelCount) { DoubleArray(TAPS_PER_PHASE) }
-
-    /**
-     * Write cursor into each delay line. After a write-and-advance,
-     * this points at the *oldest* sample in the ring.
-     */
+    private val delayLines = Array(channelCount) { DoubleArray(TAPS_PER_PHASE) }
     private val writePos = IntArray(channelCount) { 0 }
-
-    /** Running true-peak (linear) per channel. */
     private val truePeakLin = DoubleArray(channelCount) { 0.0 }
-
-    /** Running sample-peak (linear) per channel. */
     private val samplePeakLin = DoubleArray(channelCount) { 0.0 }
 
-    /**
-     * Feed a block of interleaved-by-channel audio into the detector.
-     *
-     * @param channels  One [DoubleArray] per channel, each holding the
-     *                  same number of samples normalised to ±1.0.
-     */
-    fun processBlock(channels: Array<DoubleArray>) {
-        require(channels.size == channelCount) {
-            "Expected $channelCount channels, got ${channels.size}"
-        }
+    /** Processes a single channel safely across parallel threads */
+    fun processChannel(ch: Int, samples: DoubleArray, numFrames: Int) {
+        val ring = delayLines[ch]
+        var pos = writePos[ch]
+        var tpMax = truePeakLin[ch]
+        var spMax = samplePeakLin[ch]
 
-        for (ch in 0 until channelCount) {
-            val samples = channels[ch]
-            val ring = delayLines[ch]
-            var pos = writePos[ch]
-            var tpMax = truePeakLin[ch]
-            var spMax = samplePeakLin[ch]
+        for (s in 0 until numFrames) {
+            val sample = samples[s]
 
-            for (s in samples.indices) {
-                val sample = samples[s]
+            // Sample-peak tracking
+            val absSample = abs(sample)
+            if (absSample > spMax) spMax = absSample
 
-                // --- sample-peak tracking (pre-oversampling) ---
-                val absSample = abs(sample)
-                if (absSample > spMax) spMax = absSample
+            // Push into delay line
+            ring[pos] = sample
+            pos = (pos + 1) % TAPS_PER_PHASE
 
-                // --- push sample into delay line ---
-                ring[pos] = sample
-                pos = (pos + 1) % TAPS_PER_PHASE
-                // `pos` now points at the oldest sample
-
-                // --- polyphase FIR: compute 4 interpolated values ---
-                for (phase in 0 until PHASES) {
-                    val coeffs = PHASE_COEFFS[phase]
-                    var acc = 0.0
-                    // coeffs[0] pairs with newest sample,
-                    // coeffs[TAPS-1] pairs with oldest sample.
-                    // newest = ring[(pos - 1 + T) % T],
-                    //    i.e. ring[(pos + T - 1 - k) % T] for tap k.
-                    for (t in 0 until TAPS_PER_PHASE) {
-                        val idx =
-                            (pos + TAPS_PER_PHASE - 1 - t) % TAPS_PER_PHASE
-                        acc += coeffs[t] * ring[idx]
-                    }
-                    val absInterp = abs(acc)
-                    if (absInterp > tpMax) tpMax = absInterp
+            // Polyphase FIR
+            for (phase in 0 until PHASES) {
+                val coeffs = PHASE_COEFFS[phase]
+                var acc = 0.0
+                for (t in 0 until TAPS_PER_PHASE) {
+                    val idx = (pos + TAPS_PER_PHASE - 1 - t) % TAPS_PER_PHASE
+                    acc += coeffs[t] * ring[idx]
                 }
+                val absInterp = abs(acc)
+                if (absInterp > tpMax) tpMax = absInterp
             }
-
-            writePos[ch] = pos
-            truePeakLin[ch] = tpMax
-            samplePeakLin[ch] = spMax
         }
+
+        writePos[ch] = pos
+        truePeakLin[ch] = tpMax
+        samplePeakLin[ch] = spMax
     }
 
-    /**
-     * True-peak level per channel in **dB TP**
-     * (decibels relative to full scale, true-peak measurement).
-     *
-     * Returns [Double.NEGATIVE_INFINITY] for silent channels.
-     */
-    fun getTruePeakDb(): DoubleArray =
-        DoubleArray(channelCount) { ch ->
-            if (truePeakLin[ch] > 0.0) 20.0 * log10(truePeakLin[ch])
-            else Double.NEGATIVE_INFINITY
-        }
+    fun getTruePeakDb(): DoubleArray = DoubleArray(channelCount) { ch ->
+        if (truePeakLin[ch] > 0.0) 20.0 * log10(truePeakLin[ch]) else Double.NEGATIVE_INFINITY
+    }
 
-    /**
-     * Sample-peak level per channel in **dB FS**.
-     */
-    fun getSamplePeakDb(): DoubleArray =
-        DoubleArray(channelCount) { ch ->
-            if (samplePeakLin[ch] > 0.0) 20.0 * log10(samplePeakLin[ch])
-            else Double.NEGATIVE_INFINITY
-        }
+    fun getSamplePeakDb(): DoubleArray = DoubleArray(channelCount) { ch ->
+        if (samplePeakLin[ch] > 0.0) 20.0 * log10(samplePeakLin[ch]) else Double.NEGATIVE_INFINITY
+    }
 
-    /** True-peak as a linear ratio (1.0 = 0 dB TP). */
-    fun getTruePeakLinear(): DoubleArray = truePeakLin.copyOf()
-
-    /** Sample-peak as a linear ratio (1.0 = 0 dB FS). */
-    fun getSamplePeakLinear(): DoubleArray = samplePeakLin.copyOf()
-
-    /** Reset all internal state and peak accumulators. */
     fun reset() {
         for (ch in 0 until channelCount) {
             delayLines[ch].fill(0.0)

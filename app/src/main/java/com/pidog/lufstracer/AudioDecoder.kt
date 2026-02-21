@@ -1,4 +1,3 @@
-// AudioDecoder.kt
 package com.pidog.lufstracer
 
 import android.content.Context
@@ -9,6 +8,8 @@ import android.media.AudioFormat
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
 import java.io.IOException
 import android.net.Uri
 
@@ -30,16 +31,11 @@ data class DecodedAudioInfo(
 )
 
 object AudioChannelMapper {
-    // Standard Android/WAVE Bitmask Positions
-    // Map: Bitmask -> Pair(Name, Weight)
-    // Weight 0.0 = Ignored in LUFS (e.g., LFE)
-    // Weight 1.0 = Standard
-    // Weight 1.41 = +1.5dB (Surrounds)
     private val CHANNEL_MAP = linkedMapOf(
         AudioFormat.CHANNEL_OUT_FRONT_LEFT to Pair("Front Left", 1.0f),
         AudioFormat.CHANNEL_OUT_FRONT_RIGHT to Pair("Front Right", 1.0f),
         AudioFormat.CHANNEL_OUT_FRONT_CENTER to Pair("Front Center", 1.0f),
-        AudioFormat.CHANNEL_OUT_LOW_FREQUENCY to Pair("LFE (Subwoofer)", 0.0f), // Ignored in standard LUFS
+        AudioFormat.CHANNEL_OUT_LOW_FREQUENCY to Pair("LFE (Subwoofer)", 0.0f),
         AudioFormat.CHANNEL_OUT_BACK_LEFT to Pair("Back Left", 1.41f),
         AudioFormat.CHANNEL_OUT_BACK_RIGHT to Pair("Back Right", 1.41f),
         AudioFormat.CHANNEL_OUT_FRONT_LEFT_OF_CENTER to Pair("Front Left Center", 1.0f),
@@ -52,36 +48,21 @@ object AudioChannelMapper {
 
     fun getChannelsFromMask(mask: Int, count: Int): List<ChannelMetadata> {
         val list = mutableListOf<ChannelMetadata>()
-
-        // If mask is invalid (0), assume generic mono/stereo/multichannel
         if (mask <= 0) {
             return when (count) {
                 1 -> listOf(ChannelMetadata("Mono", true, 1.0f))
-                2 -> listOf(
-                    ChannelMetadata("Front Left", true, 1.0f),
-                    ChannelMetadata("Front Right", true, 1.0f)
-                )
+                2 -> listOf(ChannelMetadata("Front Left", true, 1.0f), ChannelMetadata("Front Right", true, 1.0f))
                 else -> List(count) { ChannelMetadata("Channel ${it + 1}", true, 1.0f) }
             }
         }
-
-        // Iterate through bits to maintain PCM interleaving order (lowest bit first)
         for ((bit, info) in CHANNEL_MAP) {
             if ((mask and bit) != 0) {
-                list.add(ChannelMetadata(
-                    name = info.first,
-                    isUsedInLufs = info.second > 0f,
-                    lufsWeight = info.second
-                ))
+                list.add(ChannelMetadata(info.first, info.second > 0f, info.second))
             }
         }
-
-        // Safety: If count exceeds mask bits (common in non-standard files),
-        // fill the rest with generic channels with weight 1.0 (Included in LUFS)
         while (list.size < count) {
             list.add(ChannelMetadata("Channel ${list.size + 1}", true, 1.0f))
         }
-
         return list.take(count)
     }
 }
@@ -120,24 +101,17 @@ class AudioDecoder(private val context: Context) {
                 }
             }
 
-            if (trackIndex < 0 || format == null) {
-                return@withContext Result.failure(Exception("No audio track found"))
-            }
+            if (trackIndex < 0 || format == null) return@withContext Result.failure(Exception("No audio track found"))
 
             extractor.selectTrack(trackIndex)
             val mime = format.getString(MediaFormat.KEY_MIME)!!
-            val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
-                format.getLong(MediaFormat.KEY_DURATION)
-            } else 0L
+            val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else 0L
 
             val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-            val channelMask = if (format.containsKey(MediaFormat.KEY_CHANNEL_MASK)) {
-                format.getInteger(MediaFormat.KEY_CHANNEL_MASK)
-            } else 0
+            val channelMask = if (format.containsKey(MediaFormat.KEY_CHANNEL_MASK)) format.getInteger(MediaFormat.KEY_CHANNEL_MASK) else 0
 
             val channelList = AudioChannelMapper.getChannelsFromMask(channelMask, channelCount)
-
             val layoutName = when (channelCount) {
                 1 -> "Mono"
                 2 -> "Stereo"
@@ -146,9 +120,16 @@ class AudioDecoder(private val context: Context) {
                 else -> "$channelCount Channels"
             }
 
-            Log.d(TAG, "Layout: $layoutName. Channel breakdown: ${channelList.map { "${it.name}(${it.lufsWeight})" }}")
-
             val analyzer = LufsAnalyzer(sampleRate, channelCount, channelList, analyzeAllChannels)
+
+            // MULTITHREADING PIPELINE:
+            // Creates an asynchronous tube allowing decoder and analyzer to run at the same time
+            val audioChannel = Channel<FloatArray>(capacity = 16)
+            val analyzerJob = launch(Dispatchers.Default) {
+                for (buffer in audioChannel) {
+                    analyzer.processSamples(buffer)
+                }
+            }
 
             codec = MediaCodec.createDecoderByType(mime)
             codec.configure(format, null, null, 0)
@@ -160,6 +141,7 @@ class AudioDecoder(private val context: Context) {
             var totalPcmBytes = 0L
             val floatBuffer = FloatArray(BUFFER_SIZE)
             var lastProgressUpdate = 0L
+            var floatIdx = 0
 
             while (!outputEos) {
                 if (!inputEos) {
@@ -190,26 +172,19 @@ class AudioDecoder(private val context: Context) {
                     if (outputBuf != null && bufferInfo.size > 0) {
                         outputBuf.position(bufferInfo.offset)
                         val numSamples = bufferInfo.size / 2
-                        var floatIdx = 0
 
                         for (i in 0 until numSamples) {
                             val byteIdx = i * 2
                             if (byteIdx + 1 < outputBuf.limit()) {
-                                val sample = (
-                                        (outputBuf.get(byteIdx + 1).toInt() shl 8) or
-                                                (outputBuf.get(byteIdx).toInt() and 0xFF)
-                                        ).toShort()
+                                val sample = ((outputBuf.get(byteIdx + 1).toInt() shl 8) or (outputBuf.get(byteIdx).toInt() and 0xFF)).toShort()
                                 floatBuffer[floatIdx++] = sample.toFloat() / 32768.0f
 
                                 if (floatIdx >= floatBuffer.size) {
-                                    analyzer.processSamples(floatBuffer)
+                                    // Send buffer into asynchronous tube instead of blocking decoding loop
+                                    audioChannel.send(floatBuffer.copyOf())
                                     floatIdx = 0
                                 }
                             }
-                        }
-                        if (floatIdx > 0) {
-                            val remaining = FloatArray(floatIdx) { floatBuffer[it] }
-                            analyzer.processSamples(remaining)
                         }
                         totalPcmBytes += bufferInfo.size
                     }
@@ -220,21 +195,23 @@ class AudioDecoder(private val context: Context) {
                 }
             }
 
+            // Push leftovers
+            if (floatIdx > 0) {
+                audioChannel.send(floatBuffer.copyOfRange(0, floatIdx))
+            }
+
+            // Wait for mathematical analysis to catch up & finish
+            audioChannel.close()
+            analyzerJob.join()
+
             onProgress(1.0f)
             val metrics = analyzer.calculateMetrics()
-            Log.d(TAG, "Done: Integrated=${String.format("%.2f", metrics.integrated)} LUFS")
-
-            metrics.duration = durationUs / 1_000_000.0;
+            metrics.duration = durationUs / 1_000_000.0
 
             Result.success(DecodedAudioInfo(
-                sampleRate = sampleRate,
-                channelCount = channelCount,
-                channelLayout = layoutName,
-                channelList = channelList,
-                durationUs = durationUs,
-                totalPcmBytes = totalPcmBytes,
-                durationSeconds = durationUs / 1_000_000.0,
-                lufsMetrics = metrics
+                sampleRate = sampleRate, channelCount = channelCount, channelLayout = layoutName,
+                channelList = channelList, durationUs = durationUs, totalPcmBytes = totalPcmBytes,
+                durationSeconds = durationUs / 1_000_000.0, lufsMetrics = metrics
             ))
 
         } catch (e: Exception) {

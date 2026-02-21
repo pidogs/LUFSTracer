@@ -1,8 +1,11 @@
 package com.pidog.lufstracer
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlin.math.*
 
-// ── Unboxed growing double array ─────────────────────────────────────────────
 private class PrimitiveDoubleList(initialCapacity: Int = 256) {
     var data = DoubleArray(initialCapacity)
         private set
@@ -14,6 +17,7 @@ private class PrimitiveDoubleList(initialCapacity: Int = 256) {
         data[size++] = value
     }
 
+    fun get(index: Int): Double = data[index]
     fun toDoubleArray(): DoubleArray = data.copyOf(size)
     fun isEmpty() = size == 0
 }
@@ -31,30 +35,16 @@ class LufsAnalyzer(
     private val blockSize = (0.4 * sampleRate).toInt()
     private val stepSize = (0.1 * sampleRate).toInt()
 
-    // Overall weighted 400 ms block powers (unboxed)
     private val powers400ms = PrimitiveDoubleList(8192)
-
-    // Per-channel unweighted 400 ms block powers (unboxed)
-    private val channelPowers400ms =
-        Array(channelCount) { PrimitiveDoubleList(8192) }
-
-    // BS.1770-5 Annex 2 true-peak detector
+    private val channelPowers400ms = Array(channelCount) { PrimitiveDoubleList(8192) }
     private val truePeakDetector = TruePeakDetector(channelCount)
 
-    // Overlap kept between processSamples calls (at most blockSize - stepSize)
-    private var overlapBuffer: Array<DoubleArray> =
-        Array(channelCount) { DoubleArray(0) }
+    private var overlapBuffer: Array<DoubleArray> = Array(channelCount) { DoubleArray(0) }
     private var leftoverSamples = FloatArray(0)
 
-    // Reusable deinterleave buffer – grown as needed, never shrunk
-    private var channelsBuf: Array<DoubleArray> =
-        Array(channelCount) { DoubleArray(0) }
-
-    // Reusable filter output buffers
-    private var filtBuf1: Array<DoubleArray> =
-        Array(channelCount) { DoubleArray(0) }
-    private var filtBuf2: Array<DoubleArray> =
-        Array(channelCount) { DoubleArray(0) }
+    private var channelsBuf: Array<DoubleArray> = Array(channelCount) { DoubleArray(0) }
+    private var filtBuf1: Array<DoubleArray> = Array(channelCount) { DoubleArray(0) }
+    private var filtBuf2: Array<DoubleArray> = Array(channelCount) { DoubleArray(0) }
 
     init {
         val (coeffs1, coeffs2) = getKWeightingCoeffs(sampleRate)
@@ -70,8 +60,6 @@ class LufsAnalyzer(
         }
     }
 
-    // ── Channel role detection ────────────────────────────────────────────────
-
     private fun isLfeChannel(ch: Int): Boolean {
         val name = channelList.getOrNull(ch)?.name?.uppercase() ?: ""
         if ("LFE" in name || "SUB" in name) return true
@@ -84,100 +72,96 @@ class LufsAnalyzer(
         return channelCount >= 6 && (ch == 4 || ch == 5)
     }
 
-    // ── Streaming input ───────────────────────────────────────────────────────
-
-    fun processSamples(interleavedSamples: FloatArray) {
-        // Prepend any leftover from previous call without boxing
+    // MULTITHREADED PROCESSING
+    suspend fun processSamples(interleavedSamples: FloatArray) = coroutineScope {
         val source: FloatArray
-        val sourceOffset: Int
         if (leftoverSamples.isNotEmpty()) {
-            val merged = FloatArray(leftoverSamples.size + interleavedSamples.size)
-            leftoverSamples.copyInto(merged)
-            interleavedSamples.copyInto(merged, leftoverSamples.size)
-            source = merged
-            sourceOffset = 0
+            source = FloatArray(leftoverSamples.size + interleavedSamples.size)
+            leftoverSamples.copyInto(source)
+            interleavedSamples.copyInto(source, leftoverSamples.size)
         } else {
             source = interleavedSamples
-            sourceOffset = 0
         }
 
-        val completeFrames = source.size / channelCount
+        val totalFloats = source.size
+        val completeFrames = totalFloats / channelCount
         val usedFloats = completeFrames * channelCount
-        leftoverSamples =
-            if (usedFloats < source.size) source.copyOfRange(usedFloats, source.size)
-            else FloatArray(0)
 
-        if (completeFrames == 0) return
+        leftoverSamples = if (usedFloats < totalFloats) source.copyOfRange(usedFloats, totalFloats) else FloatArray(0)
 
-        // ── Grow reusable deinterleave buffers if needed ──
-        if (channelsBuf[0].size < completeFrames) {
-            channelsBuf = Array(channelCount) { DoubleArray(completeFrames) }
-            filtBuf1 = Array(channelCount) { DoubleArray(completeFrames) }
-            filtBuf2 = Array(channelCount) { DoubleArray(completeFrames) }
+        if (completeFrames == 0) return@coroutineScope
+
+        // Exponentially grow array to prevent constant GC reallocation freezes
+        if (channelsBuf.isEmpty() || channelsBuf[0].size < completeFrames) {
+            val newCap = max(channelsBuf.getOrNull(0)?.size?.times(2) ?: completeFrames, completeFrames)
+            channelsBuf = Array(channelCount) { DoubleArray(newCap) }
+            filtBuf1 = Array(channelCount) { DoubleArray(newCap) }
+            filtBuf2 = Array(channelCount) { DoubleArray(newCap) }
         }
 
-        // Deinterleave into reusable buffer
+        // Deinterleave on main scope (very fast, no need to thread)
         for (frame in 0 until completeFrames) {
-            val base = sourceOffset + frame * channelCount
+            val base = frame * channelCount
             for (ch in 0 until channelCount) {
                 channelsBuf[ch][frame] = source[base + ch].toDouble()
             }
         }
 
-        // True-peak detection (operates on the full channel views)
-        // Wrap in views of the correct length to avoid passing stale tail data
-        val channelViews =
-            if (channelsBuf[0].size == completeFrames) channelsBuf
-            else Array(channelCount) { ch ->
-                channelsBuf[ch].copyOf(completeFrames)
-            }
-        truePeakDetector.processBlock(channelViews)
+        // --- Execute channels in parallel ---
+        val jobs = (0 until channelCount).map { ch ->
+            async(Dispatchers.Default) {
+                // 1. True Peak Math
+                truePeakDetector.processChannel(ch, channelsBuf[ch], completeFrames)
 
-        // K-weighting: filter in-place into reusable output buffers
-        filter1.process(channelsBuf, completeFrames, filtBuf1)
-        filter2.process(filtBuf1, completeFrames, filtBuf2)
-        // filtBuf2 now holds K-weighted samples for indices [0, completeFrames)
+                // 2. K-Weighting Math
+                filter1.processChannel(ch, channelsBuf[ch], completeFrames, filtBuf1[ch])
+                filter2.processChannel(ch, filtBuf1[ch], completeFrames, filtBuf2[ch])
 
-        // ── Slice 400 ms gating blocks with 75 % overlap ──
-        // Reads across (overlapBuffer ++ filtBuf2[0..completeFrames))
-        // WITHOUT physically concatenating the two arrays.
-        val overlapLen = overlapBuffer[0].size
-        val totalLen = overlapLen + completeFrames
-        var pos = 0
-
-        while (pos + blockSize <= totalLen) {
-            var weightedSum = 0.0
-
-            for (ch in 0 until channelCount) {
+                // 3. Slice 400ms overlap strictly for this channel
+                var pos = 0
                 val ovCh = overlapBuffer[ch]
                 val newCh = filtBuf2[ch]
-                var sumSq = 0.0
+                val chPowers = channelPowers400ms[ch]
+                val overlapLen = ovCh.size
+                val totalLen = overlapLen + completeFrames
 
-                for (i in 0 until blockSize) {
-                    val idx = pos + i
-                    val v = if (idx < overlapLen) ovCh[idx] else newCh[idx - overlapLen]
-                    sumSq += v * v
+                while (pos + blockSize <= totalLen) {
+                    var sumSq = 0.0
+                    for (i in 0 until blockSize) {
+                        val idx = pos + i
+                        val v = if (idx < overlapLen) ovCh[idx] else newCh[idx - overlapLen]
+                        sumSq += v * v
+                    }
+                    chPowers.add(sumSq / blockSize)
+                    pos += stepSize
                 }
-
-                val avgPower = sumSq / blockSize
-                channelPowers400ms[ch].add(avgPower)
-                weightedSum += avgPower * weights[ch]
+                pos // return position block finished at
             }
-
-            powers400ms.add(weightedSum)
-            pos += stepSize
         }
 
-        // Save the tail as the next overlap (≤ blockSize - stepSize samples)
+        val endPositions = jobs.awaitAll()
+        val pos = endPositions[0] // Since block sizes match, pos is identical across channels
+
+        // Synchronously aggregate block sums to overall metrics
+        val oldBlocks = powers400ms.size
+        val newBlocks = channelPowers400ms[0].size
+        for (i in oldBlocks until newBlocks) {
+            var weightedSum = 0.0
+            for (ch in 0 until channelCount) {
+                weightedSum += channelPowers400ms[ch].get(i) * weights[ch]
+            }
+            powers400ms.add(weightedSum)
+        }
+
+        // Update Overlap buffers
+        val overlapLen = overlapBuffer[0].size
+        val totalLen = overlapLen + completeFrames
         val remaining = totalLen - pos
+
         if (remaining == 0) {
             overlapBuffer = Array(channelCount) { DoubleArray(0) }
         } else {
-            // Reuse existing overlap arrays if they are the right size
-            val newOverlap =
-                if (overlapBuffer[0].size == remaining) overlapBuffer
-                else Array(channelCount) { DoubleArray(remaining) }
-
+            val newOverlap = if (overlapBuffer[0].size == remaining) overlapBuffer else Array(channelCount) { DoubleArray(remaining) }
             for (ch in 0 until channelCount) {
                 val ovCh = overlapBuffer[ch]
                 val newCh = filtBuf2[ch]
@@ -197,12 +181,10 @@ class LufsAnalyzer(
         val powers = powers400ms.toDoubleArray()
         if (powers.isEmpty()) return emptyMetrics()
 
-        val (integrated, relThreshold) =
-            computeGatedLoudnessWithThreshold(powers)
+        val (integrated, relThreshold) = computeGatedLoudnessWithThreshold(powers)
         val momentary = computeMomentaryMax(powers)
         val stValues = computeShortTermValues(powers)
-        val shortTerm =
-            if (stValues.isNotEmpty()) stValues.max() else integrated
+        val shortTerm = if (stValues.isNotEmpty()) stValues.max() else integrated
         val histogram = buildHistogram(stValues)
         val lra = computeLra(stValues)
 
@@ -216,8 +198,7 @@ class LufsAnalyzer(
             val chIntegrated = computeGatedLoudness(chPowers)
             val chMomentary = computeMomentaryMax(chPowers)
             val chStValues = computeShortTermValues(chPowers)
-            val chShortTerm =
-                if (chStValues.isNotEmpty()) chStValues.max() else chIntegrated
+            val chShortTerm = if (chStValues.isNotEmpty()) chStValues.max() else chIntegrated
 
             ChannelLoudness(
                 channelName = channelList.getOrNull(ch)?.name ?: "Ch ${ch + 1}",
@@ -248,32 +229,21 @@ class LufsAnalyzer(
         )
     }
 
-    // ── LR balance ────────────────────────────────────────────────────────────
-
     fun calculateLrShift(): Double {
         if (channelCount < 2) return 0.0
         val leftPowers = channelPowers400ms[0].toDoubleArray()
         val rightPowers = channelPowers400ms[1].toDoubleArray()
         if (leftPowers.isEmpty() || rightPowers.isEmpty()) return 0.0
-        return computeGatedLoudness(rightPowers) -
-                computeGatedLoudness(leftPowers)
+        return computeGatedLoudness(rightPowers) - computeGatedLoudness(leftPowers)
     }
 
-    // ── Gating helpers (BS.1770-5 §Annex 1, eqs 3–7) ─────────────────────────
+    private fun computeGatedLoudness(powers: DoubleArray): Double = computeGatedLoudnessWithThreshold(powers).first
 
-    private fun computeGatedLoudness(powers: DoubleArray): Double =
-        computeGatedLoudnessWithThreshold(powers).first
-
-    private fun computeGatedLoudnessWithThreshold(
-        powers: DoubleArray
-    ): Pair<Double, Double> {
+    private fun computeGatedLoudnessWithThreshold(powers: DoubleArray): Pair<Double, Double> {
         if (powers.isEmpty()) return Pair(-70.0, -70.0)
 
-        val blockLoudness = DoubleArray(powers.size) {
-            -0.691 + 10.0 * log10(powers[it] + 1e-12)
-        }
+        val blockLoudness = DoubleArray(powers.size) { -0.691 + 10.0 * log10(powers[it] + 1e-12) }
 
-        // Absolute gate at −70 LKFS
         var absCount = 0
         var absSum = 0.0
         for (i in powers.indices) {
@@ -284,10 +254,8 @@ class LufsAnalyzer(
         }
         if (absCount == 0) return Pair(-70.0, -70.0)
 
-        val relThreshold =
-            -0.691 + 10.0 * log10(absSum / absCount + 1e-12) - 10.0
+        val relThreshold = -0.691 + 10.0 * log10(absSum / absCount + 1e-12) - 10.0
 
-        // Relative gate
         var relCount = 0
         var relSum = 0.0
         for (i in powers.indices) {
@@ -299,8 +267,7 @@ class LufsAnalyzer(
         }
         if (relCount == 0) return Pair(-70.0, relThreshold)
 
-        val integrated =
-            -0.691 + 10.0 * log10(relSum / relCount + 1e-12)
+        val integrated = -0.691 + 10.0 * log10(relSum / relCount + 1e-12)
         return Pair(integrated, relThreshold)
     }
 
@@ -330,8 +297,7 @@ class LufsAnalyzer(
     private fun computeLra(stValues: DoubleArray): Double {
         if (stValues.isEmpty()) return 0.0
         val sorted = stValues.sorted()
-        val hi = sorted[(sorted.size * 0.95).toInt()
-            .coerceAtMost(sorted.lastIndex)]
+        val hi = sorted[(sorted.size * 0.95).toInt().coerceAtMost(sorted.lastIndex)]
         val lo = sorted[(sorted.size * 0.10).toInt()]
         return hi - lo
     }
@@ -350,82 +316,45 @@ class LufsAnalyzer(
 
         val minKey = buckets.keys.min()
         val maxKey = buckets.keys.max()
-        return (minKey..maxKey).map { key ->
-            HistogramBucket(key, buckets[key] ?: 0)
-        }
+        return (minKey..maxKey).map { key -> HistogramBucket(key, buckets[key] ?: 0) }
     }
 
-    // ── Empty result ──────────────────────────────────────────────────────────
-
     private fun emptyMetrics() = LufsMetrics(
-        integrated = -70.0,
-        truePeak = -70.0,
-        shortTerm = -70.0,
-        momentary = -70.0,
-        dynamicRange = 0.0,
-        plr = 0.0,
-        psr = 0.0,
-        relativeThreshold = -70.0,
-        samplePeak = -70.0,
-        leftRightShift = 0.0,
-        channelMetrics = emptyList(),
-        shortTermHistogram = emptyList(),
-        duration = 0.0
+        integrated = -70.0, truePeak = -70.0, shortTerm = -70.0, momentary = -70.0,
+        dynamicRange = 0.0, plr = 0.0, psr = 0.0, relativeThreshold = -70.0,
+        samplePeak = -70.0, leftRightShift = 0.0, channelMetrics = emptyList(),
+        shortTermHistogram = emptyList(), duration = 0.0
     )
-
-    // ── Biquad IIR filter (transposed direct form II) ─────────────────────────
 
     private class ManualBiquad(
         val b: DoubleArray,
         val a: DoubleArray,
         numChannels: Int
     ) {
-        // State: [x1, x2, y1, y2] per channel — persists across calls
         private val state = Array(numChannels) { DoubleArray(4) }
 
-        /**
-         * Process [frameCount] frames from [input] into [output].
-         * Both arrays must have at least [frameCount] elements per channel.
-         * Output arrays are written in-place; no allocation occurs.
-         */
-        fun process(
-            input: Array<DoubleArray>,
-            frameCount: Int,
-            output: Array<DoubleArray>
-        ) {
+        // Process a single channel thread-safely
+        fun processChannel(ch: Int, inCh: DoubleArray, frameCount: Int, outCh: DoubleArray) {
+            val st = state[ch]
+            var x1 = st[0]; var x2 = st[1]
+            var y1 = st[2]; var y2 = st[3]
+
             val b0 = b[0]; val b1c = b[1]; val b2c = b[2]
             val a1c = a[1]; val a2c = a[2]
 
-            for (ch in input.indices) {
-                val st = state[ch]
-                var x1 = st[0]; var x2 = st[1]
-                var y1 = st[2]; var y2 = st[3]
-                val inCh = input[ch]
-                val outCh = output[ch]
-
-                for (n in 0 until frameCount) {
-                    val xn = inCh[n]
-                    val yn = b0 * xn + b1c * x1 + b2c * x2 -
-                            a1c * y1 - a2c * y2
-                    outCh[n] = yn
-                    x2 = x1; x1 = xn; y2 = y1; y1 = yn
-                }
-
-                st[0] = x1; st[1] = x2; st[2] = y1; st[3] = y2
+            for (n in 0 until frameCount) {
+                val xn = inCh[n]
+                val yn = b0 * xn + b1c * x1 + b2c * x2 - a1c * y1 - a2c * y2
+                outCh[n] = yn
+                x2 = x1; x1 = xn; y2 = y1; y1 = yn
             }
+            st[0] = x1; st[1] = x2; st[2] = y1; st[3] = y2
         }
     }
 
-    // ── K-weighting coefficient generation ───────────────────────────────────
-
     companion object {
-        private fun getKWeightingCoeffs(
-            fs: Int
-        ): Pair<
-                Pair<DoubleArray, DoubleArray>,
-                Pair<DoubleArray, DoubleArray>> {
+        private fun getKWeightingCoeffs(fs: Int): Pair<Pair<DoubleArray, DoubleArray>, Pair<DoubleArray, DoubleArray>> {
             val fsD = fs.toDouble()
-
             val f0 = 1681.97445095022
             val G = 3.9988776988675
             val Q = 0.7071
@@ -433,26 +362,14 @@ class LufsAnalyzer(
             val Vh = 10.0.pow(G / 20.0)
             val Vb = sqrt(Vh)
             val d = 1.0 + Vb / Q * K + K * K
-            val b1 = doubleArrayOf(
-                (Vh + Vb / Q * K + K * K) / d,
-                2.0 * (K * K - Vh) / d,
-                (Vh - Vb / Q * K + K * K) / d
-            )
-            val a1 = doubleArrayOf(
-                1.0,
-                2.0 * (K * K - 1.0) / d,
-                (1.0 - Vb / Q * K + K * K) / d
-            )
+            val b1 = doubleArrayOf((Vh + Vb / Q * K + K * K) / d, 2.0 * (K * K - Vh) / d, (Vh - Vb / Q * K + K * K) / d)
+            val a1 = doubleArrayOf(1.0, 2.0 * (K * K - 1.0) / d, (1.0 - Vb / Q * K + K * K) / d)
 
             val f0Hp = 38.1354708760226
             val kHp = tan(PI * f0Hp / fsD)
             val dHp = 1.0 + kHp / 0.5 + kHp * kHp
             val b2 = doubleArrayOf(1.0 / dHp, -2.0 / dHp, 1.0 / dHp)
-            val a2 = doubleArrayOf(
-                1.0,
-                2.0 * (kHp * kHp - 1.0) / dHp,
-                (1.0 - kHp / 0.5 + kHp * kHp) / dHp
-            )
+            val a2 = doubleArrayOf(1.0, 2.0 * (kHp * kHp - 1.0) / dHp, (1.0 - kHp / 0.5 + kHp * kHp) / dHp)
 
             return Pair(Pair(b1, a1), Pair(b2, a2))
         }
