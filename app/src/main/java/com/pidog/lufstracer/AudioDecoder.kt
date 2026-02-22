@@ -13,7 +13,7 @@ import kotlinx.coroutines.channels.Channel
 import java.io.IOException
 import android.net.Uri
 
-data class ChannelMetadata(
+data class ChannelMetadata(z
     val name: String,
     val isUsedInLufs: Boolean,
     val lufsWeight: Float
@@ -209,9 +209,14 @@ class AudioDecoder(private val context: Context) {
             metrics.duration = durationUs / 1_000_000.0
 
             Result.success(DecodedAudioInfo(
-                sampleRate = sampleRate, channelCount = channelCount, channelLayout = layoutName,
-                channelList = channelList, durationUs = durationUs, totalPcmBytes = totalPcmBytes,
-                durationSeconds = durationUs / 1_000_000.0, lufsMetrics = metrics
+                sampleRate = sampleRate,
+                channelCount = channelCount,
+                channelLayout = layoutName,
+                channelList = channelList,
+                durationUs = durationUs,
+                totalPcmBytes = totalPcmBytes,
+                durationSeconds = durationUs / 1_000_000.0,
+                lufsMetrics = metrics
             ))
 
         } catch (e: Exception) {

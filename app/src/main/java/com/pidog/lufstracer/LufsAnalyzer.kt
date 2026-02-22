@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlin.Int
 import kotlin.math.*
 
 private class PrimitiveDoubleList(initialCapacity: Int = 256) {
@@ -186,6 +187,8 @@ class LufsAnalyzer(
         val stValues = computeShortTermValues(powers)
         val shortTerm = if (stValues.isNotEmpty()) stValues.max() else integrated
         val histogram = buildHistogram(stValues)
+        val minval = histogram[0].rangeStartDb;
+        val maxval = histogram.last().rangeStartDb;
         val lra = computeLra(stValues)
 
         val tpPerCh = truePeakDetector.getTruePeakDb()
@@ -225,6 +228,8 @@ class LufsAnalyzer(
             leftRightShift = calculateLrShift(),
             channelMetrics = channelMetrics,
             shortTermHistogram = histogram,
+            histogramMin = minval,
+            histogramMax = maxval,
             duration = 0.0
         )
     }
@@ -320,10 +325,21 @@ class LufsAnalyzer(
     }
 
     private fun emptyMetrics() = LufsMetrics(
-        integrated = -70.0, truePeak = -70.0, shortTerm = -70.0, momentary = -70.0,
-        dynamicRange = 0.0, plr = 0.0, psr = 0.0, relativeThreshold = -70.0,
-        samplePeak = -70.0, leftRightShift = 0.0, channelMetrics = emptyList(),
-        shortTermHistogram = emptyList(), duration = 0.0
+        integrated = -70.0,
+        truePeak = -70.0,
+        shortTerm = -70.0,
+        momentary = -70.0,
+        dynamicRange = 0.0,
+        plr = 0.0,
+        psr = 0.0,
+        relativeThreshold = -70.0,
+        samplePeak = -70.0,
+        leftRightShift = 0.0,
+        channelMetrics = emptyList(),
+        shortTermHistogram = emptyList(),
+        histogramMin = -70,
+        histogramMax = 30,
+        duration = 0.0
     )
 
     private class ManualBiquad(
