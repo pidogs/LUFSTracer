@@ -33,3 +33,11 @@ data class ChannelLoudness(
     val isUsedInLufs: Boolean,
     val lufsWeight: Float
 )
+
+data class FileHistoryEntry(
+    val id: String,
+    val fileName: String,
+    val timestamp: Long,
+    val integratedLufs: Double,
+    val truePeak: Double
+)

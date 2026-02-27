@@ -13,7 +13,7 @@ import kotlinx.coroutines.channels.Channel
 import java.io.IOException
 import android.net.Uri
 
-data class ChannelMetadata(z
+data class ChannelMetadata(
     val name: String,
     val isUsedInLufs: Boolean,
     val lufsWeight: Float
