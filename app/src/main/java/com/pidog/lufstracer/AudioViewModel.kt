@@ -54,6 +54,14 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var predictedRemaining by mutableLongStateOf(0L)
         private set
+    var etaTimestampMs by mutableLongStateOf(0L)
+        private set
+
+    private data class ProgressSnapshot(val progress: Float, val timeMs: Long)
+
+    private val etaEstimator = EtaEstimator()
+    @Volatile
+    private var latestProgressSnapshot = ProgressSnapshot(0f, 0L)
 
     var fileName by mutableStateOf("")
         private set
@@ -114,6 +122,8 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         metrics = null
         audioInfo = null
         progress = 0f
+        latestProgressSnapshot = ProgressSnapshot(0f, 0L)
+        etaTimestampMs = 0L
         statusText = "Select an audio file to analyze"
         val app = getApplication<Application>()
         val notificationManager = NotificationManagerCompat.from(app)
@@ -149,24 +159,22 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
             // Ignore if provider doesn't support persistable permissions
         }
 
-        if (!isDbPaused) {
-            val fileHash = compute100kHash(app, uri)
-            if (fileHash != null) {
-                val cachedInfo = dbHelper.getCachedResult(fileHash)
-                if (cachedInfo != null) {
-                    audioInfo = cachedInfo
-                    metrics = cachedInfo.lufsMetrics
-                    statusText = "Analysis complete!"
-                    hasStarted = true
-                    isDecoding = false
-                    isProcessingPhase = false
-                    progress = 1f
-                    cachedInfo.lufsMetrics?.let { m ->
-                        historyManager.saveEntry(fileName, uri.toString(), m, cachedInfo.processingTimeMs)
-                        loadHistory()
-                    }
-                    return
+        val precomputedFileHash = if (!isDbPaused) compute100kHash(app, uri) else null
+        if (precomputedFileHash != null) {
+            val cachedInfo = dbHelper.getCachedResult(precomputedFileHash)
+            if (cachedInfo != null) {
+                audioInfo = cachedInfo
+                metrics = cachedInfo.lufsMetrics
+                statusText = "Analysis complete!"
+                hasStarted = true
+                isDecoding = false
+                isProcessingPhase = false
+                progress = 1f
+                cachedInfo.lufsMetrics?.let { m ->
+                    historyManager.saveEntry(fileName, uri.toString(), m, cachedInfo.processingTimeMs)
+                    loadHistory()
                 }
+                return
             }
         }
 
@@ -174,10 +182,13 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         isDecoding = true
         isProcessingPhase = false
         progress = 0f
+        latestProgressSnapshot = ProgressSnapshot(0f, 0L)
         startTime = System.currentTimeMillis()
         elapsedTime = 0L
         predictedTotalTime = 0L
         predictedRemaining = 0L
+        etaTimestampMs = 0L
+        etaEstimator.reset(startTime)
         statusText = "Decoding and analyzing audio..."
         metrics = null
         audioInfo = null
@@ -188,12 +199,16 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         timerJob = viewModelScope.launch {
             while (isActive && isDecoding) {
                 delay(100)
-                if (isDecoding) {
+                if (isDecoding && !isProcessingPhase) {
                     val now = System.currentTimeMillis()
+                    val snap = latestProgressSnapshot
+                    progress = snap.progress
                     elapsedTime = now - startTime
-                    if ((progress > 0.01f) && !isProcessingPhase) {
-                        predictedTotalTime = (elapsedTime / progress).toLong()
-                        predictedRemaining = (predictedTotalTime - elapsedTime).coerceAtLeast(0L)
+                    val remaining = etaEstimator.update(snap.progress, snap.timeMs, now)
+                    if (remaining != null) {
+                        predictedRemaining = remaining
+                        etaTimestampMs = etaEstimator.getEtaEpochMs()
+                        predictedTotalTime = elapsedTime + remaining
                     }
                 }
             }
@@ -241,14 +256,8 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
                 var lastNotifyTime = 0L
 
                 val res = decoder.decodeUri(uri) { progressUpdate ->
-                    progress = progressUpdate
                     val now = System.currentTimeMillis()
-                    elapsedTime = now - startTime
-                    if (progressUpdate > 0.01f) {
-                        predictedTotalTime = (elapsedTime / progressUpdate).toLong()
-                        predictedRemaining = (predictedTotalTime - elapsedTime).coerceAtLeast(0L)
-                    }
-
+                    latestProgressSnapshot = ProgressSnapshot(progressUpdate, now)
                     if (now - lastNotifyTime > 500) {
                         notificationBuilder.setProgress(
                             100,
@@ -289,7 +298,7 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
                         statusText = "Analysis complete!"
 
                         if (!isDbPaused) {
-                            val fileHash = compute100kHash(app, uri)
+                            val fileHash = precomputedFileHash ?: compute100kHash(app, uri)
                             if (fileHash != null) {
                                 dbHelper.saveResult(fileHash, fileName, uri.toString(), finalInfo)
                             }

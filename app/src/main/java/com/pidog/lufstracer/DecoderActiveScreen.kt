@@ -25,6 +25,7 @@ fun DecoderActiveScreen(
     fileName: String,
     elapsedTime: Long,
     predictedRemaining: Long,
+    etaTimestampMs: Long = 0L,
     audioInfo: DecodedAudioInfo?,
     metrics: LufsMetrics?,
     statusText: String,
@@ -115,11 +116,11 @@ fun DecoderActiveScreen(
                                 TimeInfoItem(label = "Elapsed", time = formatTime(elapsedTime))
                                 TimeInfoItem(
                                     label = "Remaining",
-                                    time = if (progress > 0.01f) formatTime(predictedRemaining) else "--:--"
+                                    time = if (etaTimestampMs > 0L) formatTime(predictedRemaining) else "--:--"
                                 )
                                 TimeInfoItem(
                                     label = "ETA",
-                                    time = if (progress > 0.01f) formatEtaTime(predictedRemaining) else "--:--:--"
+                                    time = if (etaTimestampMs > 0L) formatClockTime(etaTimestampMs) else "--:--:--"
                                 )
                             }
                         }

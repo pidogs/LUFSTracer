@@ -150,4 +150,84 @@ class TruePeakDetectorTest {
         assertEquals(fresh.getTruePeakDb()[0], detector.getTruePeakDb()[0], EXACT_DELTA)
         assertEquals(fresh.getSamplePeakDb()[0], detector.getSamplePeakDb()[0], EXACT_DELTA)
     }
+
+    @Test
+    fun l1SkipMatchesBruteForceReferenceAcrossWaveforms() {
+        // Brute-force reference polyphase FIR (evaluates every phase on every sample, zero skipping)
+        val phaseCoeffs = arrayOf(
+            doubleArrayOf(
+                0.0017089843750, 0.0109863281250, -0.0196533203125, 0.0332031250000,
+                -0.0594482421875, 0.1373291015625, 0.9721679687500, -0.1022949218750,
+                0.0476074218750, -0.0266113281250, 0.0148925781250, -0.0083007812500
+            ),
+            doubleArrayOf(
+                -0.0291748046875, 0.0292968750000, -0.0517578125000, 0.0891113281250,
+                -0.1665039062500, 0.4650878906250, 0.7797851562500, -0.2003173828125,
+                0.1015625000000, -0.0582275390625, 0.0330810546875, -0.0189208984375
+            ),
+            doubleArrayOf(
+                -0.0189208984375, 0.0330810546875, -0.0582275390625, 0.1015625000000,
+                -0.2003173828125, 0.7797851562500, 0.4650878906250, -0.1665039062500,
+                0.0891113281250, -0.0517578125000, 0.0292968750000, -0.0291748046875
+            ),
+            doubleArrayOf(
+                -0.0083007812500, 0.0148925781250, -0.0266113281250, 0.0476074218750,
+                -0.1022949218750, 0.9721679687500, 0.1373291015625, -0.0594482421875,
+                0.0332031250000, -0.0196533203125, 0.0109863281250, 0.0017089843750
+            )
+        )
+
+        fun bruteForceTruePeakDb(signal: DoubleArray): Double {
+            val ring = DoubleArray(12)
+            var pos = 0
+            var tpMax = 0.0
+            for (s in signal) {
+                ring[pos] = s
+                pos = (pos + 1) % 12
+                for (p in 0 until 4) {
+                    var acc = 0.0
+                    for (t in 0 until 12) {
+                        acc += phaseCoeffs[p][(t)] * ring[(pos + 11 - t) % 12]
+                    }
+                    val a = kotlin.math.abs(acc)
+                    if (a > tpMax) tpMax = a
+                }
+            }
+            return if (tpMax > 0.0) 20.0 * kotlin.math.log10(tpMax) else Double.NEGATIVE_INFINITY
+        }
+
+        // Waveform 1: sparse transients + late higher inter-sample peak (heavily exercises L1 skip)
+        val sparse = DoubleArray(20_000) { i ->
+            when {
+                i in 500..520 -> 0.5 * sin(2.0 * PI * 3000.0 * i / 48_000.0)
+                i in 15_000..15_040 -> (if ((i / 2) % 2 == 0) 0.65 else -0.65)
+                else -> 0.02 * sin(2.0 * PI * 440.0 * i / 48_000.0)
+            }
+        }
+
+        // Waveform 2: dense near-full-scale brickwalled audio (exercises continuous hot path)
+        val dense = DoubleArray(10_000) { i ->
+            (0.95 * sin(2.0 * PI * 11_000.0 * i / 48_000.0)).coerceIn(-0.9, 0.9)
+        }
+
+        for (signal in listOf(sparse, dense)) {
+            val expectedDb = bruteForceTruePeakDb(signal)
+
+            val fastWhole = TruePeakDetector(1).apply { processChannel(0, signal, signal.size) }
+            assertEquals(expectedDb, fastWhole.getTruePeakDb()[0], EXACT_DELTA)
+
+            // Also verify across tiny prime chunks
+            val fastChunked = TruePeakDetector(1)
+            val sizes = intArrayOf(1, 3, 5, 7, 11, 13, 19, 101)
+            var offset = 0
+            var idx = 0
+            while (offset < signal.size) {
+                val len = minOf(sizes[idx % sizes.size], signal.size - offset)
+                fastChunked.processChannel(0, signal.copyOfRange(offset, offset + len), len)
+                offset += len
+                idx++
+            }
+            assertEquals(expectedDb, fastChunked.getTruePeakDb()[0], EXACT_DELTA)
+        }
+    }
 }

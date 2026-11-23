@@ -114,9 +114,13 @@ fun formatTime(millis: Long): String {
 
 // Format remaining time to clock time (ETA)
 fun formatEtaTime(remainingMillis: Long): String {
-    val etaTime = System.currentTimeMillis() + remainingMillis
+    return formatClockTime(System.currentTimeMillis() + remainingMillis)
+}
+
+// Format an absolute epoch timestamp to HH:MM:SS clock time
+fun formatClockTime(epochMillis: Long): String {
     val calendar = Calendar.getInstance()
-    calendar.timeInMillis = etaTime
+    calendar.timeInMillis = epochMillis
     return String.format(
         "%02d:%02d:%02d",
         calendar.get(Calendar.HOUR_OF_DAY),

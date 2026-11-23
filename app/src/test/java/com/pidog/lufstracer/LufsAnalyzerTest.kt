@@ -773,4 +773,147 @@ class LufsAnalyzerTest {
         )
         assertEquals(loudOnlyMetrics.integrated, combinedMetrics.integrated, 0.25)
     }
+
+    @Test
+    fun processPcm16MatchesFloatSamplesBitExactly() = runBlocking {
+        val sampleRate = 48_000
+        val meta = listOf(
+            ChannelMetadata("Front Left", true, 1.0f),
+            ChannelMetadata("Front Right", true, 1.0f),
+            ChannelMetadata("Front Center", true, 1.0f),
+            ChannelMetadata("LFE (Subwoofer)", false, 0.0f),
+            ChannelMetadata("Side Left", true, 1.41f),
+            ChannelMetadata("Side Right", true, 1.41f)
+        )
+
+        val floatSignal = generateSurround51Signal(sampleRate)
+        val pcm16 = ShortArray(floatSignal.size) { i ->
+            (floatSignal[i] * 32767.0f).toInt().coerceIn(-32768, 32767).toShort()
+        }
+        val normalizedFromPcm16 = FloatArray(pcm16.size) { i ->
+            pcm16[i].toFloat() / 32768.0f
+        }
+
+        val viaFloat = LufsAnalyzer(sampleRate, 6, meta).apply {
+            processSamples(normalizedFromPcm16)
+        }.calculateMetrics()
+
+        val viaPcm16Monolithic = LufsAnalyzer(sampleRate, 6, meta).apply {
+            processPcm16(pcm16, pcm16.size)
+        }.calculateMetrics()
+
+        val viaPcm16Chunked = LufsAnalyzer(sampleRate, 6, meta).apply {
+            val sizes = intArrayOf(1, 5, 7, 11, 17, 1003, 32768)
+            var offset = 0
+            var idx = 0
+            while (offset < pcm16.size) {
+                val len = minOf(sizes[idx % sizes.size], pcm16.size - offset)
+                processPcm16(pcm16.copyOfRange(offset, offset + len), len)
+                offset += len
+                idx++
+            }
+        }.calculateMetrics()
+
+        assertMetricsEqual(viaFloat, viaPcm16Monolithic, EXACT_DELTA)
+        assertMetricsEqual(viaFloat, viaPcm16Chunked, EXACT_DELTA)
+    }
+
+    @Test
+    fun nonDivisibleSampleRate11025HzFallbackIsChunkInvariant() = runBlocking {
+        // At 11025 Hz: stepSize = 1102, blockSize = 4410 != 4 * 1102 -> exercises general overlap fallback
+        val sampleRate = 11_025
+        val meta = listOf(
+            ChannelMetadata("Front Left", true, 1.0f),
+            ChannelMetadata("Front Right", true, 1.0f)
+        )
+        val signal = generateStereoDynamicSignal(sampleRate)
+
+        val monolithic = LufsAnalyzer(sampleRate, 2, meta).apply {
+            processSamples(signal)
+        }.calculateMetrics()
+
+        val chunked = LufsAnalyzer(sampleRate, 2, meta).apply {
+            val sizes = intArrayOf(3, 7, 19, 503, 4093, 16384)
+            var offset = 0
+            var idx = 0
+            while (offset < signal.size) {
+                val len = minOf(sizes[idx % sizes.size], signal.size - offset)
+                processSamples(signal.copyOfRange(offset, offset + len))
+                offset += len
+                idx++
+            }
+        }.calculateMetrics()
+
+        assertMetricsEqual(monolithic, chunked, EXACT_DELTA)
+        assertTrue(monolithic.integrated > -30.0 && monolithic.integrated < -5.0)
+    }
+
+    @Test
+    fun wavHeaderParserHandlesStandardExtensibleAndFallbacks() {
+        fun le16(v: Int): ByteArray = byteArrayOf((v and 0xFF).toByte(), ((v ushr 8) and 0xFF).toByte())
+        fun le32(v: Long): ByteArray = byteArrayOf(
+            (v and 0xFF).toByte(),
+            ((v ushr 8) and 0xFF).toByte(),
+            ((v ushr 16) and 0xFF).toByte(),
+            ((v ushr 24) and 0xFF).toByte()
+        )
+
+        // 1. Standard 16-bit PCM WAV with an odd-length JUNK chunk before data
+        val pcmPayload = byteArrayOf(0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00)
+        val standardWav = java.io.ByteArrayOutputStream().apply {
+            write("RIFF".toByteArray())
+            write(le32(100))
+            write("WAVE".toByteArray())
+            // Odd-sized JUNK chunk (size = 5 + 1 pad byte)
+            write("JUNK".toByteArray())
+            write(le32(5))
+            write(byteArrayOf(1, 2, 3, 4, 5, 0))
+            // fmt chunk (16 bytes, PCM=1, 2ch, 48000Hz, 16-bit)
+            write("fmt ".toByteArray())
+            write(le32(16))
+            write(le16(1))
+            write(le16(2))
+            write(le32(48_000))
+            write(le32(48_000L * 4))
+            write(le16(4))
+            write(le16(16))
+            // data chunk
+            write("data".toByteArray())
+            write(le32(pcmPayload.size.toLong()))
+            write(pcmPayload)
+        }.toByteArray()
+
+        val stream = java.io.ByteArrayInputStream(standardWav)
+        val info = WavHeaderParser.parsePcm16Header(stream)
+        assertTrue("Expected standard 16-bit PCM WAV to parse", info != null)
+        assertEquals(48_000, info!!.sampleRate)
+        assertEquals(2, info.channelCount)
+        assertEquals(8L, info.dataBytes)
+        // Stream must now be positioned at the exact start of pcmPayload
+        val remaining = stream.readBytes()
+        assertTrue(pcmPayload.contentEquals(remaining))
+
+        // 2. 24-bit WAV should return null (fall back to MediaCodec)
+        val wav24 = java.io.ByteArrayOutputStream().apply {
+            write("RIFF".toByteArray())
+            write(le32(60))
+            write("WAVE".toByteArray())
+            write("fmt ".toByteArray())
+            write(le32(16))
+            write(le16(1))
+            write(le16(2))
+            write(le32(48_000))
+            write(le32(48_000L * 6))
+            write(le16(6))
+            write(le16(24))
+            write("data".toByteArray())
+            write(le32(6))
+            write(ByteArray(6))
+        }.toByteArray()
+        assertEquals(null, WavHeaderParser.parsePcm16Header(java.io.ByteArrayInputStream(wav24)))
+
+        // 3. Non-WAV data (e.g. MP3 ID3 tag) should return null
+        val mp3Bytes = "ID3\u0003\u0000\u0000\u0000\u0000\u0000\u0000hello world!".toByteArray()
+        assertEquals(null, WavHeaderParser.parsePcm16Header(java.io.ByteArrayInputStream(mp3Bytes)))
+    }
 }

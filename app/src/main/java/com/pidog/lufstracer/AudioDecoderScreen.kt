@@ -209,6 +209,7 @@ fun AudioDecoderScreen(
                 fileName = viewModel.fileName,
                 elapsedTime = viewModel.elapsedTime,
                 predictedRemaining = viewModel.predictedRemaining,
+                etaTimestampMs = viewModel.etaTimestampMs,
                 audioInfo = viewModel.audioInfo,
                 metrics = viewModel.metrics,
                 statusText = viewModel.statusText,
