@@ -31,7 +31,7 @@ fun DecoderActiveScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(30.dp)
+            .padding(horizontal = 12.dp, vertical = 8.dp)
             .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -124,7 +124,7 @@ fun DecoderActiveScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             audioInfo?.let { info ->
                 Card(
@@ -147,11 +147,14 @@ fun DecoderActiveScreen(
                         Text("Channels: ${info.channelCount}")
                         Text("Layout: ${info.channelLayout}")
                         Text("Duration: ${"%.2f".format(info.durationSeconds)}s")
+                        if (info.processingTimeMs > 0) {
+                            Text("Processing Time: ${"%.2f".format(info.processingTimeMs / 1000.0)}s (${info.processingTimeMs} ms)")
+                        }
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             metrics?.let { m ->
                 LoudnessTabs(

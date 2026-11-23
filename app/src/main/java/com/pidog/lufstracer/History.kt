@@ -12,7 +12,8 @@ data class HistoryEntry(
     val fileName: String,
     val fileUri: String, // Store the URI or path so you know what file it was
     val timestamp: Long = System.currentTimeMillis(),
-    val metrics: LufsMetrics
+    val metrics: LufsMetrics,
+    val processingTimeMs: Long = 0L
 )
 
 class HistoryManager(private val context: Context) {
@@ -49,7 +50,8 @@ class HistoryManager(private val context: Context) {
     fun saveEntry(
         fileName: String,
         fileUri: String,
-        metrics: LufsMetrics
+        metrics: LufsMetrics,
+        processingTimeMs: Long = 0L
     ) {
         val currentHistory = loadHistory().toMutableList()
 
@@ -59,7 +61,8 @@ class HistoryManager(private val context: Context) {
         val newEntry = HistoryEntry(
             fileName = fileName,
             fileUri = fileUri,
-            metrics = metrics
+            metrics = metrics,
+            processingTimeMs = processingTimeMs
         )
 
         currentHistory.add(0, newEntry) // Add to top

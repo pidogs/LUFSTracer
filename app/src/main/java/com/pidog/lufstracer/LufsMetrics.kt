@@ -39,5 +39,6 @@ data class FileHistoryEntry(
     val fileName: String,
     val timestamp: Long,
     val integratedLufs: Double,
-    val truePeak: Double
+    val truePeak: Double,
+    val processingTimeMs: Long = 0L
 )

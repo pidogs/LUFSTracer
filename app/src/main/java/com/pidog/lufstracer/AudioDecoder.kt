@@ -27,7 +27,8 @@ data class DecodedAudioInfo(
     val durationUs: Long,
     val totalPcmBytes: Long,
     val durationSeconds: Double,
-    val lufsMetrics: LufsMetrics? = null
+    val lufsMetrics: LufsMetrics? = null,
+    val processingTimeMs: Long = 0L
 )
 
 object AudioChannelMapper {

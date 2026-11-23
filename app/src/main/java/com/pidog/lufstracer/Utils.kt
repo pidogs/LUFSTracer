@@ -17,6 +17,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.platform.LocalView
 import androidx.core.content.ContextCompat
+import java.security.MessageDigest
 
 private const val PREFS_NAME = "LufsTracerPrefs"
 private const val PREF_LAST_URI = "last_selected_uri"
@@ -44,6 +45,33 @@ fun getLastSelectedUri(context: Context): Uri? {
     return if (uriString != null) Uri.parse(uriString) else null
 }
 // -----------------------------------
+
+/**
+ * Computes SHA-256 hash of the file up to 100KB max.
+ * Does not hash beyond 100KB to prevent long processing times.
+ */
+fun compute100kHash(context: Context, uri: Uri): String? {
+    return try {
+        val digest = MessageDigest.getInstance("SHA-256")
+        context.contentResolver.openInputStream(uri)?.use { inputStream ->
+            val buffer = ByteArray(8192)
+            var totalRead = 0
+            val maxBytes = 100 * 1024 // 100KB limit
+            while (totalRead < maxBytes) {
+                val bytesToRead = minOf(buffer.size, maxBytes - totalRead)
+                val read = inputStream.read(buffer, 0, bytesToRead)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+                totalRead += read
+            }
+        } ?: return null
+        val hashBytes = digest.digest()
+        hashBytes.joinToString("") { "%02x".format(it) }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
 
 fun getFileNameFromUri(context: Context, uri: Uri): String {
     var result: String? = null
