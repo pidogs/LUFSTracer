@@ -6,10 +6,12 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.AudioFormat
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.ensureActive
 import java.io.IOException
 import android.net.Uri
 
@@ -128,6 +130,7 @@ class AudioDecoder(private val context: Context) {
             val audioChannel = Channel<FloatArray>(capacity = 16)
             val analyzerJob = launch(Dispatchers.Default) {
                 for (buffer in audioChannel) {
+                    ensureActive()
                     analyzer.processSamples(buffer)
                 }
             }
@@ -145,6 +148,7 @@ class AudioDecoder(private val context: Context) {
             var floatIdx = 0
 
             while (!outputEos) {
+                coroutineContext.ensureActive()
                 if (!inputEos) {
                     val inputId = codec.dequeueInputBuffer(TIMEOUT_US)
                     if (inputId >= 0) {
@@ -221,6 +225,10 @@ class AudioDecoder(private val context: Context) {
             ))
 
         } catch (e: Exception) {
+            if (e is CancellationException) {
+                Log.d(TAG, "Decode cancelled")
+                throw e
+            }
             Log.e(TAG, "Decode failed", e)
             Result.failure(e)
         } finally {

@@ -212,7 +212,8 @@ fun AudioDecoderScreen(
                 audioInfo = viewModel.audioInfo,
                 metrics = viewModel.metrics,
                 statusText = viewModel.statusText,
-                onPickNewAudioClick = onPickFile
+                onPickNewAudioClick = onPickFile,
+                onCancelClick = { viewModel.cancelDecoding() }
             )
         }
     }

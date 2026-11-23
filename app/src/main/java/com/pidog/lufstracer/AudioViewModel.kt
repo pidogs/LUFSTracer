@@ -19,6 +19,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -102,16 +103,27 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         dbHelper.clearAll()
     }
 
-    fun resetToHome() {
+    fun cancelDecoding() {
         decodingJob?.cancel()
         timerJob?.cancel()
-        hasStarted = false
+        decodingJob = null
+        timerJob = null
         isDecoding = false
         isProcessingPhase = false
+        hasStarted = false
         metrics = null
         audioInfo = null
         progress = 0f
         statusText = "Select an audio file to analyze"
+        val app = getApplication<Application>()
+        val notificationManager = NotificationManagerCompat.from(app)
+        try {
+            notificationManager.cancel(notificationId)
+        } catch (_: Exception) { }
+    }
+
+    fun resetToHome() {
+        cancelDecoding()
     }
 
     fun selectHistoryItem(id: String) {
@@ -189,135 +201,142 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
 
         decodingJob = viewModelScope.launch(Dispatchers.Default) {
             val notificationManager = NotificationManagerCompat.from(app)
-            val intent = Intent(app, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            }
-            val pendingIntent = PendingIntent.getActivity(
-                app,
-                0,
-                intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
+            try {
+                val intent = Intent(app, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                }
+                val pendingIntent = PendingIntent.getActivity(
+                    app,
+                    0,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
 
-            val notificationBuilder = NotificationCompat.Builder(app, channelId)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle("Analyzing $fileName")
-                .setContentText("Decoding audio...")
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setContentIntent(pendingIntent)
-                .setProgress(100, 0, false)
+                val notificationBuilder = NotificationCompat.Builder(app, channelId)
+                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setContentTitle("Analyzing $fileName")
+                    .setContentText("Decoding audio...")
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                    .setContentIntent(pendingIntent)
+                    .setProgress(100, 0, false)
 
-            val hasNotificationPerm =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    ContextCompat.checkSelfPermission(
-                        app,
-                        Manifest.permission.POST_NOTIFICATIONS
-                    ) == PackageManager.PERMISSION_GRANTED
-                } else true
+                val hasNotificationPerm =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        ContextCompat.checkSelfPermission(
+                            app,
+                            Manifest.permission.POST_NOTIFICATIONS
+                        ) == PackageManager.PERMISSION_GRANTED
+                    } else true
 
-            if (hasNotificationPerm) {
+                if (hasNotificationPerm) {
+                    try {
+                        notificationManager.notify(notificationId, notificationBuilder.build())
+                    } catch (_: SecurityException) {
+                        // Ignore missing permission edge case
+                    }
+                }
+
+                var lastNotifyTime = 0L
+
+                val res = decoder.decodeUri(uri) { progressUpdate ->
+                    progress = progressUpdate
+                    val now = System.currentTimeMillis()
+                    elapsedTime = now - startTime
+                    if (progressUpdate > 0.01f) {
+                        predictedTotalTime = (elapsedTime / progressUpdate).toLong()
+                        predictedRemaining = (predictedTotalTime - elapsedTime).coerceAtLeast(0L)
+                    }
+
+                    if (now - lastNotifyTime > 500) {
+                        notificationBuilder.setProgress(
+                            100,
+                            (progressUpdate * 100).toInt(),
+                            false
+                        ).setContentText("Decoding... ${(progressUpdate * 100).toInt()}%")
+                        if (hasNotificationPerm) {
+                            try {
+                                notificationManager.notify(notificationId, notificationBuilder.build())
+                            } catch (_: SecurityException) {
+                                // Ignore missing permission edge case
+                            }
+                        }
+                        lastNotifyTime = now
+                    }
+                }
+
+                isProcessingPhase = true
+                progress = 0f
+
+                notificationBuilder.setContentText("Calculating loudness metrics...")
+                    .setProgress(100, 100, true)
+                if (hasNotificationPerm) {
+                    try {
+                        notificationManager.notify(notificationId, notificationBuilder.build())
+                    } catch (_: SecurityException) {
+                        // Ignore missing permission edge case
+                    }
+                }
+
+                res.fold(
+                    onSuccess = { info ->
+                        val totalProcessTime = System.currentTimeMillis() - startTime
+                        val finalInfo = info.copy(processingTimeMs = totalProcessTime)
+
+                        audioInfo = finalInfo
+                        metrics = finalInfo.lufsMetrics
+                        statusText = "Analysis complete!"
+
+                        if (!isDbPaused) {
+                            val fileHash = compute100kHash(app, uri)
+                            if (fileHash != null) {
+                                dbHelper.saveResult(fileHash, fileName, uri.toString(), finalInfo)
+                            }
+                        }
+
+                        finalInfo.lufsMetrics?.let { m ->
+                            historyManager.saveEntry(fileName, uri.toString(), m, totalProcessTime)
+                            loadHistory()
+                        }
+
+                        notificationBuilder.setContentText("Analysis complete!")
+                            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                            .setProgress(0, 0, false)
+                            .setOngoing(false)
+                        if (hasNotificationPerm) {
+                            try {
+                                notificationManager.notify(notificationId, notificationBuilder.build())
+                            } catch (_: SecurityException) {
+                                // Ignore missing permission edge case
+                            }
+                        }
+                    },
+                    onFailure = { error ->
+                        statusText = "Error: ${error.message}"
+
+                        notificationBuilder.setContentText("Error: ${error.message}")
+                            .setSmallIcon(android.R.drawable.stat_notify_error)
+                            .setProgress(0, 0, false)
+                            .setOngoing(false)
+                        if (hasNotificationPerm) {
+                            try {
+                                notificationManager.notify(notificationId, notificationBuilder.build())
+                            } catch (_: SecurityException) {
+                                // Ignore missing permission edge case
+                            }
+                        }
+                    }
+                )
+
+                isDecoding = false
+                isProcessingPhase = false
+            } catch (e: CancellationException) {
                 try {
-                    notificationManager.notify(notificationId, notificationBuilder.build())
-                } catch (_: SecurityException) {
-                    // Ignore missing permission edge case
-                }
+                    notificationManager.cancel(notificationId)
+                } catch (_: Exception) { }
+                throw e
             }
-
-            var lastNotifyTime = 0L
-
-            val res = decoder.decodeUri(uri) { progressUpdate ->
-                progress = progressUpdate
-                val now = System.currentTimeMillis()
-                elapsedTime = now - startTime
-                if (progressUpdate > 0.01f) {
-                    predictedTotalTime = (elapsedTime / progressUpdate).toLong()
-                    predictedRemaining = (predictedTotalTime - elapsedTime).coerceAtLeast(0L)
-                }
-
-                if (now - lastNotifyTime > 500) {
-                    notificationBuilder.setProgress(
-                        100,
-                        (progressUpdate * 100).toInt(),
-                        false
-                    ).setContentText("Decoding... ${(progressUpdate * 100).toInt()}%")
-                    if (hasNotificationPerm) {
-                        try {
-                            notificationManager.notify(notificationId, notificationBuilder.build())
-                        } catch (_: SecurityException) {
-                            // Ignore missing permission edge case
-                        }
-                    }
-                    lastNotifyTime = now
-                }
-            }
-
-            isProcessingPhase = true
-            progress = 0f
-
-            notificationBuilder.setContentText("Calculating loudness metrics...")
-                .setProgress(100, 100, true)
-            if (hasNotificationPerm) {
-                try {
-                    notificationManager.notify(notificationId, notificationBuilder.build())
-                } catch (_: SecurityException) {
-                    // Ignore missing permission edge case
-                }
-            }
-
-            res.fold(
-                onSuccess = { info ->
-                    val totalProcessTime = System.currentTimeMillis() - startTime
-                    val finalInfo = info.copy(processingTimeMs = totalProcessTime)
-
-                    audioInfo = finalInfo
-                    metrics = finalInfo.lufsMetrics
-                    statusText = "Analysis complete!"
-
-                    if (!isDbPaused) {
-                        val fileHash = compute100kHash(app, uri)
-                        if (fileHash != null) {
-                            dbHelper.saveResult(fileHash, fileName, uri.toString(), finalInfo)
-                        }
-                    }
-
-                    finalInfo.lufsMetrics?.let { m ->
-                        historyManager.saveEntry(fileName, uri.toString(), m, totalProcessTime)
-                        loadHistory()
-                    }
-
-                    notificationBuilder.setContentText("Analysis complete!")
-                        .setSmallIcon(android.R.drawable.stat_sys_download_done)
-                        .setProgress(0, 0, false)
-                        .setOngoing(false)
-                    if (hasNotificationPerm) {
-                        try {
-                            notificationManager.notify(notificationId, notificationBuilder.build())
-                        } catch (_: SecurityException) {
-                            // Ignore missing permission edge case
-                        }
-                    }
-                },
-                onFailure = { error ->
-                    statusText = "Error: ${error.message}"
-
-                    notificationBuilder.setContentText("Error: ${error.message}")
-                        .setSmallIcon(android.R.drawable.stat_notify_error)
-                        .setProgress(0, 0, false)
-                        .setOngoing(false)
-                    if (hasNotificationPerm) {
-                        try {
-                            notificationManager.notify(notificationId, notificationBuilder.build())
-                        } catch (_: SecurityException) {
-                            // Ignore missing permission edge case
-                        }
-                    }
-                }
-            )
-
-            isDecoding = false
-            isProcessingPhase = false
         }
     }
 }

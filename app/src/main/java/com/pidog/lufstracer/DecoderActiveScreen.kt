@@ -4,6 +4,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -26,7 +28,8 @@ fun DecoderActiveScreen(
     audioInfo: DecodedAudioInfo?,
     metrics: LufsMetrics?,
     statusText: String,
-    onPickNewAudioClick: () -> Unit
+    onPickNewAudioClick: () -> Unit,
+    onCancelClick: () -> Unit = {}
 ) {
     Column(
         modifier = modifier
@@ -119,6 +122,29 @@ fun DecoderActiveScreen(
                                     time = if (progress > 0.01f) formatEtaTime(predictedRemaining) else "--:--:--"
                                 )
                             }
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Button(
+                            onClick = onCancelClick,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Cancel Processing",
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Cancel Processing",
+                                style = MaterialTheme.typography.titleMedium
+                            )
                         }
                     }
                 }
