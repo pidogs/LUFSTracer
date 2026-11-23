@@ -3,9 +3,11 @@ package com.pidog.lufstracer
 import android.content.Context
 import android.media.AudioFormat
 import android.media.MediaCodec
+import android.media.MediaDataSource
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -19,6 +21,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 
 data class ChannelMetadata(
     val name: String,
@@ -223,20 +226,69 @@ class AudioDecoder(private val context: Context) {
         private const val PROGRESS_INTERVAL_NS = 50_000_000L // 50 ms wall-clock
     }
 
+    private class TrackingFileDataSource(
+        private val pfd: ParcelFileDescriptor,
+        private val fis: FileInputStream,
+        private val channel: FileChannel,
+        val fileSize: Long
+    ) : MediaDataSource() {
+        @Volatile var trackingEnabled: Boolean = false
+        @Volatile var startBytePos: Long = -1L
+        @Volatile var currentBytePos: Long = 0L
+
+        override fun getSize(): Long = fileSize
+
+        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            if (position >= fileSize) return -1
+            val toRead = minOf(size.toLong(), fileSize - position).toInt()
+            if (toRead <= 0) return 0
+            val byteBuf = ByteBuffer.wrap(buffer, offset, toRead)
+            var totalRead = 0
+            var pos = position
+            while (totalRead < toRead) {
+                val read = channel.read(byteBuf, pos)
+                if (read <= 0) break
+                totalRead += read
+                pos += read
+            }
+            if (totalRead == 0) return -1
+            if (trackingEnabled) {
+                if (startBytePos < 0L) startBytePos = position
+                val endPos = position + totalRead
+                if (endPos > currentBytePos) currentBytePos = endPos
+            }
+            return totalRead
+        }
+
+        fun getProgressFraction(): Float {
+            if (!trackingEnabled || startBytePos < 0L || currentBytePos <= startBytePos) return -1f
+            val span = fileSize - startBytePos
+            if (span <= 0L) return -1f
+            return ((currentBytePos - startBytePos).toDouble() / span.toDouble()).toFloat().coerceIn(0f, 0.999f)
+        }
+
+        override fun close() {
+            try { fis.close() } catch (_: Exception) { }
+            try { pfd.close() } catch (_: Exception) { }
+        }
+    }
+
     private class PcmChunk(
         val shortData: ShortArray?,
         val floatData: FloatArray?,
-        val count: Int
+        val count: Int,
+        val progressHint: Float = -1f
     )
 
     suspend fun decodeUri(
         uri: Uri,
         analyzeAllChannels: Boolean = false,
+        onCalculatingMetrics: () -> Unit = {},
         onProgress: (Float) -> Unit = {}
     ): Result<DecodedAudioInfo> = withContext(Dispatchers.IO) {
         // Fast path: direct streaming for standard 16-bit PCM WAV (skips MediaCodec Binder IPC)
         try {
-            val wavResult = tryDecodeWavPcm16(uri, analyzeAllChannels, onProgress)
+            val wavResult = tryDecodeWavPcm16(uri, analyzeAllChannels, onCalculatingMetrics, onProgress)
             if (wavResult != null) return@withContext Result.success(wavResult)
         } catch (e: CancellationException) {
             Log.d(TAG, "WAV decode cancelled")
@@ -245,12 +297,13 @@ class AudioDecoder(private val context: Context) {
             Log.d(TAG, "WAV fast path unavailable, falling back to MediaCodec: ${e.message}")
         }
 
-        decodeWithMediaCodec(uri, analyzeAllChannels, onProgress)
+        decodeWithMediaCodec(uri, analyzeAllChannels, onCalculatingMetrics, onProgress)
     }
 
     private suspend fun tryDecodeWavPcm16(
         uri: Uri,
         analyzeAllChannels: Boolean,
+        onCalculatingMetrics: () -> Unit,
         onProgress: (Float) -> Unit
     ): DecodedAudioInfo? = withContext(Dispatchers.IO) {
         val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return@withContext null
@@ -346,6 +399,7 @@ class AudioDecoder(private val context: Context) {
             }
 
             onProgress(1.0f)
+            onCalculatingMetrics()
             val metrics = analyzer.calculateMetrics()
             val durationSeconds = totalPcmBytes.toDouble() / (sampleRate.toDouble() * channelCount * 2.0)
             val durationUs = (durationSeconds * 1_000_000.0).toLong()
@@ -370,17 +424,33 @@ class AudioDecoder(private val context: Context) {
     private suspend fun decodeWithMediaCodec(
         uri: Uri,
         analyzeAllChannels: Boolean,
+        onCalculatingMetrics: () -> Unit,
         onProgress: (Float) -> Unit
     ): Result<DecodedAudioInfo> = withContext(Dispatchers.IO) {
         var extractor: MediaExtractor? = null
         var codec: MediaCodec? = null
+        var dataSource: TrackingFileDataSource? = null
 
         try {
             extractor = MediaExtractor()
             val pfd = context.contentResolver.openFileDescriptor(uri, "r")
                 ?: throw IOException("Cannot open file descriptor")
-            pfd.use {
-                extractor.setDataSource(it.fileDescriptor, 0, it.statSize)
+            val fis = FileInputStream(pfd.fileDescriptor)
+            val channel = fis.channel
+            val fileSize = pfd.statSize.takeIf { it > 0L } ?: runCatching { channel.size() }.getOrDefault(-1L)
+            if (fileSize > 0L) {
+                // Byte-position MediaDataSource gives accurate 0..100% progress even on VBR MP3s
+                // whose KEY_DURATION metadata is underestimated.
+                val trackingSource = TrackingFileDataSource(pfd, fis, channel, fileSize)
+                dataSource = trackingSource
+                extractor.setDataSource(trackingSource)
+            } else {
+                try {
+                    extractor.setDataSource(pfd.fileDescriptor, 0, pfd.statSize)
+                } finally {
+                    try { fis.close() } catch (_: Exception) { }
+                    try { pfd.close() } catch (_: Exception) { }
+                }
             }
 
             var trackIndex = -1
@@ -398,6 +468,8 @@ class AudioDecoder(private val context: Context) {
             if (trackIndex < 0 || format == null) return@withContext Result.failure(Exception("No audio track found"))
 
             extractor.selectTrack(trackIndex)
+            // Start tracking byte position only after header sniffing / track selection completes
+            dataSource?.trackingEnabled = true
             val mime = format.getString(MediaFormat.KEY_MIME)!!
             val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else 0L
 
@@ -438,10 +510,17 @@ class AudioDecoder(private val context: Context) {
                         }
                         analyzerTimeNs += System.nanoTime() - t0
                         analyzedFrames += (chunk.count / channelCount).toLong()
-                        if (expectedTotalFrames > 0.0) {
-                            val nowNs = System.nanoTime()
-                            if (nowNs - lastProgressNs >= PROGRESS_INTERVAL_NS) {
-                                onProgress((analyzedFrames.toDouble() / expectedTotalFrames).toFloat().coerceIn(0f, 0.999f))
+
+                        val nowNs = System.nanoTime()
+                        if (nowNs - lastProgressNs >= PROGRESS_INTERVAL_NS) {
+                            val progressVal = when {
+                                chunk.progressHint >= 0f -> chunk.progressHint
+                                expectedTotalFrames > 0.0 ->
+                                    (analyzedFrames.toDouble() / expectedTotalFrames).toFloat().coerceIn(0f, 0.999f)
+                                else -> -1f
+                            }
+                            if (progressVal >= 0f) {
+                                onProgress(progressVal)
                                 lastProgressNs = nowNs
                             }
                         }
@@ -475,14 +554,16 @@ class AudioDecoder(private val context: Context) {
                         if (pcmEncoding == AudioFormat.ENCODING_PCM_FLOAT) {
                             // Flush any queued shorts first so sample order is preserved
                             if (writeIdx > 0) {
-                                filledBuffers.send(PcmChunk(currentBuf, null, writeIdx))
+                                val hint = dataSource?.getProgressFraction() ?: -1f
+                                filledBuffers.send(PcmChunk(currentBuf, null, writeIdx, hint))
                                 currentBuf = freeBuffers.receive()
                                 writeIdx = 0
                             }
                             val floatBuf = outputBuf.asFloatBuffer()
                             val floats = FloatArray(floatBuf.remaining())
                             floatBuf.get(floats)
-                            filledBuffers.send(PcmChunk(null, floats, floats.size))
+                            val hint = dataSource?.getProgressFraction() ?: -1f
+                            filledBuffers.send(PcmChunk(null, floats, floats.size, hint))
                         } else {
                             // Bulk native ShortBuffer copy (no byte-by-byte DirectByteBuffer JNI calls)
                             val shortBuf = outputBuf.asShortBuffer()
@@ -491,7 +572,8 @@ class AudioDecoder(private val context: Context) {
                                 shortBuf.get(currentBuf, writeIdx, toRead)
                                 writeIdx += toRead
                                 if (writeIdx == currentBuf.size) {
-                                    filledBuffers.send(PcmChunk(currentBuf, null, writeIdx))
+                                    val hint = dataSource?.getProgressFraction() ?: -1f
+                                    filledBuffers.send(PcmChunk(currentBuf, null, writeIdx, hint))
                                     currentBuf = freeBuffers.receive()
                                     writeIdx = 0
                                 }
@@ -561,7 +643,8 @@ class AudioDecoder(private val context: Context) {
 
                 // Push final partial buffer
                 if (writeIdx > 0) {
-                    filledBuffers.send(PcmChunk(currentBuf, null, writeIdx))
+                    val hint = dataSource?.getProgressFraction() ?: -1f
+                    filledBuffers.send(PcmChunk(currentBuf, null, writeIdx, hint))
                 } else {
                     freeBuffers.trySend(currentBuf)
                 }
@@ -575,6 +658,7 @@ class AudioDecoder(private val context: Context) {
             }
 
             onProgress(1.0f)
+            onCalculatingMetrics()
             val metrics = analyzer.calculateMetrics()
             metrics.duration = durationUs / 1_000_000.0
 
@@ -603,6 +687,7 @@ class AudioDecoder(private val context: Context) {
         } finally {
             try { codec?.stop(); codec?.release() } catch (_: Exception) { }
             try { extractor?.release() } catch (_: Exception) { }
+            try { dataSource?.close() } catch (_: Exception) { }
         }
     }
 

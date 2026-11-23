@@ -7,8 +7,9 @@ import android.database.sqlite.SQLiteOpenHelper
 import com.google.gson.Gson
 
 class AudioDatabaseHelper(context: Context) :
-    SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION) {
+    SQLiteOpenHelper(context.applicationContext, DATABASE_NAME, null, DATABASE_VERSION) {
 
+    private val appContext = context.applicationContext
     private val gson = Gson()
 
     companion object {
@@ -41,6 +42,7 @@ class AudioDatabaseHelper(context: Context) :
         onCreate(db)
     }
 
+    @Synchronized
     fun getCachedResult(hash: String): DecodedAudioInfo? {
         val db = readableDatabase
         val cursor = db.query(
@@ -65,6 +67,7 @@ class AudioDatabaseHelper(context: Context) :
         }
     }
 
+    @Synchronized
     fun getCachedResultByUri(uri: String): DecodedAudioInfo? {
         val db = readableDatabase
         val cursor = db.query(
@@ -89,6 +92,7 @@ class AudioDatabaseHelper(context: Context) :
         }
     }
 
+    @Synchronized
     fun saveResult(hash: String, fileName: String, fileUri: String, info: DecodedAudioInfo) {
         val db = writableDatabase
         val json = gson.toJson(info)
@@ -102,8 +106,12 @@ class AudioDatabaseHelper(context: Context) :
         db.insertWithOnConflict(TABLE_NAME, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
+    @Synchronized
     fun clearAll() {
-        val db = writableDatabase
-        db.delete(TABLE_NAME, null, null)
+        close()
+        val deleted = appContext.deleteDatabase(DATABASE_NAME)
+        if (!deleted && appContext.getDatabasePath(DATABASE_NAME).exists()) {
+            writableDatabase.delete(TABLE_NAME, null, null)
+        }
     }
 }

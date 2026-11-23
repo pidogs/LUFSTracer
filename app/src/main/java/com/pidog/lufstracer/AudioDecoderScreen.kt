@@ -36,6 +36,7 @@ fun AudioDecoderScreen(
 ) {
     val context = LocalContext.current
     var menuExpanded by remember { mutableStateOf(false) }
+    var showClearDbDialog by remember { mutableStateOf(false) }
 
     // Intercept system back button to return to home screen
     BackHandler(enabled = viewModel.hasStarted) {
@@ -180,8 +181,7 @@ fun AudioDecoderScreen(
                                 },
                                 onClick = {
                                     menuExpanded = false
-                                    viewModel.clearDatabase()
-                                    Toast.makeText(context, "Database cleared", Toast.LENGTH_SHORT).show()
+                                    showClearDbDialog = true
                                 }
                             )
                         }
@@ -217,5 +217,41 @@ fun AudioDecoderScreen(
                 onCancelClick = { viewModel.cancelDecoding() }
             )
         }
+    }
+
+    if (showClearDbDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearDbDialog = false },
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.Delete,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+            },
+            title = { Text("Clear Database?") },
+            text = {
+                Text("This will permanently delete the analysis database and recent file history. This action cannot be undone.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearDbDialog = false
+                        viewModel.clearDatabase()
+                        Toast.makeText(context, "Database cleared", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearDbDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }

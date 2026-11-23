@@ -35,6 +35,9 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
     var isDbPaused by mutableStateOf(false)
         private set
 
+    @Volatile
+    private var dbPausedFlag = false
+
     var statusText by mutableStateOf("Select an audio file to analyze")
         private set
     var isDecoding by mutableStateOf(false)
@@ -104,11 +107,15 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun togglePauseDb() {
-        isDbPaused = !isDbPaused
+        val next = !isDbPaused
+        dbPausedFlag = next
+        isDbPaused = next
     }
 
     fun clearDatabase() {
         dbHelper.clearAll()
+        historyManager.clearHistory()
+        recentHistory = emptyList()
     }
 
     fun cancelDecoding() {
@@ -159,7 +166,7 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
             // Ignore if provider doesn't support persistable permissions
         }
 
-        val precomputedFileHash = if (!isDbPaused) compute100kHash(app, uri) else null
+        val precomputedFileHash = if (!dbPausedFlag) compute100kHash(app, uri) else null
         if (precomputedFileHash != null) {
             val cachedInfo = dbHelper.getCachedResult(precomputedFileHash)
             if (cachedInfo != null) {
@@ -255,7 +262,24 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
 
                 var lastNotifyTime = 0L
 
-                val res = decoder.decodeUri(uri) { progressUpdate ->
+                val res = decoder.decodeUri(
+                    uri = uri,
+                    onCalculatingMetrics = {
+                        viewModelScope.launch {
+                            isProcessingPhase = true
+                            progress = 1f
+                        }
+                        notificationBuilder.setContentText("Calculating loudness metrics...")
+                            .setProgress(100, 100, true)
+                        if (hasNotificationPerm) {
+                            try {
+                                notificationManager.notify(notificationId, notificationBuilder.build())
+                            } catch (_: SecurityException) {
+                                // Ignore missing permission edge case
+                            }
+                        }
+                    }
+                ) { progressUpdate ->
                     val now = System.currentTimeMillis()
                     latestProgressSnapshot = ProgressSnapshot(progressUpdate, now)
                     if (now - lastNotifyTime > 500) {
@@ -275,19 +299,6 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                isProcessingPhase = true
-                progress = 0f
-
-                notificationBuilder.setContentText("Calculating loudness metrics...")
-                    .setProgress(100, 100, true)
-                if (hasNotificationPerm) {
-                    try {
-                        notificationManager.notify(notificationId, notificationBuilder.build())
-                    } catch (_: SecurityException) {
-                        // Ignore missing permission edge case
-                    }
-                }
-
                 res.fold(
                     onSuccess = { info ->
                         val totalProcessTime = System.currentTimeMillis() - startTime
@@ -297,16 +308,16 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
                         metrics = finalInfo.lufsMetrics
                         statusText = "Analysis complete!"
 
-                        if (!isDbPaused) {
+                        if (!dbPausedFlag) {
                             val fileHash = precomputedFileHash ?: compute100kHash(app, uri)
                             if (fileHash != null) {
                                 dbHelper.saveResult(fileHash, fileName, uri.toString(), finalInfo)
                             }
-                        }
 
-                        finalInfo.lufsMetrics?.let { m ->
-                            historyManager.saveEntry(fileName, uri.toString(), m, totalProcessTime)
-                            loadHistory()
+                            finalInfo.lufsMetrics?.let { m ->
+                                historyManager.saveEntry(fileName, uri.toString(), m, totalProcessTime)
+                                loadHistory()
+                            }
                         }
 
                         notificationBuilder.setContentText("Analysis complete!")
